@@ -374,23 +374,20 @@ void initButton() {
 void initBuzzer() {
   Serial.println("Initializing buzzer...");
 
-  // Setup PWM for buzzer (LEDC)
-  ledcAttach(BUZZER_PIN, 2000, 8);
+  // Set pin low initially
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
 
-  // Quick beep test
+  // Quick beep test using PWM
+  ledcAttach(BUZZER_PIN, 2000, 8);
   ledcWriteTone(BUZZER_PIN, 2000);
   ledcWrite(BUZZER_PIN, 128);
   delay(100);
 
-  // Fully stop buzzer
-  ledcWrite(BUZZER_PIN, 0);
-  ledcWriteTone(BUZZER_PIN, 0);
+  // Detach PWM and set pin low to prevent static
+  ledcDetach(BUZZER_PIN);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
-
-  // Reattach for later use
-  ledcAttach(BUZZER_PIN, 2000, 8);
-  ledcWrite(BUZZER_PIN, 0);
 
   Serial.println("  Buzzer OK (PWM)");
 }
@@ -1132,13 +1129,19 @@ void updateLEDs() {
 }
 
 void buzzerOff() {
+  if (buzzerEnabled) {
+    ledcDetach(BUZZER_PIN);
+    pinMode(BUZZER_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+  }
   buzzerEnabled = false;
   buzzerOn = false;
-  ledcWrite(BUZZER_PIN, 0);
-  ledcWriteTone(BUZZER_PIN, 0);
 }
 
 void buzzerWarning() {
+  if (!buzzerEnabled) {
+    ledcAttach(BUZZER_PIN, 2000, 8);
+  }
   buzzerEnabled = true;
   buzzerInterval = 1000;  // Slow beep
   buzzerFreq = 1800;      // Lower pitch
@@ -1146,6 +1149,9 @@ void buzzerWarning() {
 }
 
 void buzzerAlarm() {
+  if (!buzzerEnabled) {
+    ledcAttach(BUZZER_PIN, 2000, 8);
+  }
   buzzerEnabled = true;
   buzzerInterval = 300;   // Fast beep
   buzzerFreq = 3000;      // Higher pitch
@@ -1179,6 +1185,7 @@ void updateBuzzer() {
       ledcWriteTone(BUZZER_PIN, buzzerFreq);
       ledcWrite(BUZZER_PIN, buzzerDuty);
     } else {
+      // Stop tone completely to prevent static noise
       ledcWriteTone(BUZZER_PIN, 0);
       ledcWrite(BUZZER_PIN, 0);
     }
