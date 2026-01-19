@@ -208,6 +208,7 @@ void updateDisplay();
 void updateAlarms();
 void updateLEDs();
 void updateBuzzer();
+void buzzerSilence();
 void buzzerOff();
 void buzzerWarning();
 void buzzerAlarm();
@@ -1128,20 +1129,22 @@ void updateLEDs() {
   }
 }
 
+// Silence the buzzer pin completely
+void buzzerSilence() {
+  ledcDetach(BUZZER_PIN);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
 void buzzerOff() {
-  if (buzzerEnabled) {
-    ledcDetach(BUZZER_PIN);
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
+  if (buzzerEnabled || buzzerOn) {
+    buzzerSilence();
   }
   buzzerEnabled = false;
   buzzerOn = false;
 }
 
 void buzzerWarning() {
-  if (!buzzerEnabled) {
-    ledcAttach(BUZZER_PIN, 2000, 8);
-  }
   buzzerEnabled = true;
   buzzerInterval = 1000;  // Slow beep
   buzzerFreq = 1800;      // Lower pitch
@@ -1149,9 +1152,6 @@ void buzzerWarning() {
 }
 
 void buzzerAlarm() {
-  if (!buzzerEnabled) {
-    ledcAttach(BUZZER_PIN, 2000, 8);
-  }
   buzzerEnabled = true;
   buzzerInterval = 300;   // Fast beep
   buzzerFreq = 3000;      // Higher pitch
@@ -1161,7 +1161,7 @@ void buzzerAlarm() {
 void updateBuzzer() {
   // Handle alarm state changes
   if (!alarmActive || alarmMuted) {
-    if (buzzerEnabled) {
+    if (buzzerEnabled || buzzerOn) {
       buzzerOff();
     }
     return;
@@ -1182,12 +1182,12 @@ void updateBuzzer() {
     lastBuzzerToggle = now;
     buzzerOn = !buzzerOn;
     if (buzzerOn) {
-      ledcWriteTone(BUZZER_PIN, buzzerFreq);
+      // Attach PWM, play tone
+      ledcAttach(BUZZER_PIN, buzzerFreq, 8);
       ledcWrite(BUZZER_PIN, buzzerDuty);
     } else {
-      // Stop tone completely to prevent static noise
-      ledcWriteTone(BUZZER_PIN, 0);
-      ledcWrite(BUZZER_PIN, 0);
+      // Completely detach PWM and ground the pin
+      buzzerSilence();
     }
   }
 }
