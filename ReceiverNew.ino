@@ -61,7 +61,7 @@
 #define LED_RED         17
 
 // ============= BUZZER PIN =============
-#define BUZZER_PIN      25
+#define BUZZER_PIN      3   // GPIO3 (RX0) - moved from GPIO25 (DAC) to avoid static
 
 // ============= BUTTON PIN =============
 #define BUTTON_PIN      35    // Requires external 10k pull-up
@@ -378,7 +378,6 @@ void initBuzzer() {
   // Set pin low initially
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
-  dacWrite(BUZZER_PIN, 0);  // Ensure DAC is at 0
 
   // Quick beep test using PWM
   ledcAttach(BUZZER_PIN, 2000, 8);
@@ -387,7 +386,6 @@ void initBuzzer() {
 
   // Detach PWM and silence completely
   ledcDetach(BUZZER_PIN);
-  dacWrite(BUZZER_PIN, 0);  // Set DAC to 0
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
@@ -1133,7 +1131,6 @@ void updateLEDs() {
 // Silence the buzzer pin completely
 void buzzerSilence() {
   ledcDetach(BUZZER_PIN);
-  dacWrite(BUZZER_PIN, 0);  // GPIO 25 is DAC1 - set to 0
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 }
