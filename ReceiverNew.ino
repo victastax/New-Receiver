@@ -152,6 +152,13 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastBuzzerToggle = 0;
 bool buzzerState = false;
 
+// Buzzer PWM control
+bool buzzerEnabled = false;
+bool buzzerOn = false;
+unsigned long buzzerInterval = 0;
+uint16_t buzzerFreq = 0;
+uint8_t buzzerDuty = 0;
+
 // Display refresh control (prevents flickering)
 bool forceDisplayRedraw = true;
 DisplayMode lastDisplayMode = MODE_OVERVIEW;
@@ -198,6 +205,9 @@ void updateDisplay();
 void updateAlarms();
 void updateLEDs();
 void updateBuzzer();
+void buzzerOff();
+void buzzerWarning();
+void buzzerAlarm();
 void handleButton();
 
 bool parseLoRaPacket(const char* packet, TransmitterData* tx);
@@ -360,15 +370,20 @@ void initButton() {
 
 void initBuzzer() {
   Serial.println("Initializing buzzer...");
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
+
+  // Setup PWM for buzzer (LEDC)
+  ledcAttach(BUZZER_PIN, 2000, 8);
+  ledcWriteTone(BUZZER_PIN, 0);
+  ledcWrite(BUZZER_PIN, 0);
 
   // Quick beep test
-  digitalWrite(BUZZER_PIN, HIGH);
+  ledcWriteTone(BUZZER_PIN, 2000);
+  ledcWrite(BUZZER_PIN, 128);
   delay(100);
-  digitalWrite(BUZZER_PIN, LOW);
+  ledcWriteTone(BUZZER_PIN, 0);
+  ledcWrite(BUZZER_PIN, 0);
 
-  Serial.println("  Buzzer OK");
+  Serial.println("  Buzzer OK (PWM)");
 }
 
 void initSD() {
@@ -1107,20 +1122,57 @@ void updateLEDs() {
   }
 }
 
+void buzzerOff() {
+  buzzerEnabled = false;
+  buzzerOn = false;
+  ledcWriteTone(BUZZER_PIN, 0);
+  ledcWrite(BUZZER_PIN, 0);
+}
+
+void buzzerWarning() {
+  buzzerEnabled = true;
+  buzzerInterval = 1000;  // Slow beep
+  buzzerFreq = 1800;      // Lower pitch
+  buzzerDuty = 50;
+}
+
+void buzzerAlarm() {
+  buzzerEnabled = true;
+  buzzerInterval = 300;   // Fast beep
+  buzzerFreq = 3000;      // Higher pitch
+  buzzerDuty = 180;
+}
+
 void updateBuzzer() {
+  // Handle alarm state changes
   if (!alarmActive || alarmMuted) {
-    digitalWrite(BUZZER_PIN, LOW);
-    buzzerState = false;
+    if (buzzerEnabled) {
+      buzzerOff();
+    }
     return;
   }
 
-  // Buzzer pattern based on alarm level
-  unsigned long interval = (currentAlarmLevel == 2) ? 300 : 800;
+  // Set buzzer mode based on alarm level
+  if (currentAlarmLevel == 2 && buzzerFreq != 3000) {
+    buzzerAlarm();
+  } else if (currentAlarmLevel == 1 && buzzerFreq != 1800) {
+    buzzerWarning();
+  }
 
-  if (millis() - lastBuzzerToggle >= interval) {
-    buzzerState = !buzzerState;
-    digitalWrite(BUZZER_PIN, buzzerState ? HIGH : LOW);
-    lastBuzzerToggle = millis();
+  if (!buzzerEnabled) return;
+
+  // Toggle buzzer on/off for beeping pattern
+  unsigned long now = millis();
+  if (now - lastBuzzerToggle >= buzzerInterval) {
+    lastBuzzerToggle = now;
+    buzzerOn = !buzzerOn;
+    if (buzzerOn) {
+      ledcWriteTone(BUZZER_PIN, buzzerFreq);
+      ledcWrite(BUZZER_PIN, buzzerDuty);
+    } else {
+      ledcWriteTone(BUZZER_PIN, 0);
+      ledcWrite(BUZZER_PIN, 0);
+    }
   }
 }
 
@@ -1148,7 +1200,7 @@ void handleButton() {
       if (alarmActive && !alarmMuted) {
         // Mute alarm
         alarmMuted = true;
-        digitalWrite(BUZZER_PIN, LOW);
+        buzzerOff();
         Serial.println("Alarm MUTED");
       } else {
         // Cycle display mode
