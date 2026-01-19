@@ -376,14 +376,20 @@ void initBuzzer() {
 
   // Setup PWM for buzzer (LEDC)
   ledcAttach(BUZZER_PIN, 2000, 8);
-  ledcWriteTone(BUZZER_PIN, 0);
-  ledcWrite(BUZZER_PIN, 0);
 
   // Quick beep test
   ledcWriteTone(BUZZER_PIN, 2000);
   ledcWrite(BUZZER_PIN, 128);
   delay(100);
+
+  // Fully stop buzzer
+  ledcWrite(BUZZER_PIN, 0);
   ledcWriteTone(BUZZER_PIN, 0);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  // Reattach for later use
+  ledcAttach(BUZZER_PIN, 2000, 8);
   ledcWrite(BUZZER_PIN, 0);
 
   Serial.println("  Buzzer OK (PWM)");
@@ -1128,8 +1134,8 @@ void updateLEDs() {
 void buzzerOff() {
   buzzerEnabled = false;
   buzzerOn = false;
-  ledcWriteTone(BUZZER_PIN, 0);
   ledcWrite(BUZZER_PIN, 0);
+  ledcWriteTone(BUZZER_PIN, 0);
 }
 
 void buzzerWarning() {
