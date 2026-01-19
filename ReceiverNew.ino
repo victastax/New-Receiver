@@ -2,12 +2,11 @@
  * AxleWatch Receiver Firmware v2.0
  * ESP32-WROOM-32 Homebrew Hardware
  *
- * Simplified version for non-touch 1.9" ST7789 display
- * with physical button input
- *
  * Features:
  * - LoRa 433MHz reception from trailer transmitters
  * - 1.9" ST7789 TFT display (170x320) with simple UI
+ * - WiFi AP mode with web dashboard for phone viewing
+ * - Configurable alarm thresholds via web interface
  * - GPS integration for location/speed
  * - SD card logging
  * - LED status indicators (Green/Yellow/Red)
@@ -20,6 +19,8 @@
 // ======================== INCLUDES ========================
 #include <SPI.h>
 #include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <LoRa.h>
@@ -84,6 +85,11 @@
 #define SCREEN_WIDTH    320
 #define SCREEN_HEIGHT   170
 
+// WiFi AP settings
+#define AP_SSID         "AxleWatch-RX-Setup"
+#define AP_PASSWORD     "axlewatch123"
+#define AP_CHANNEL      6
+
 // ======================== GLOBAL OBJECTS ========================
 // SPI Buses
 SPIClass hspi(HSPI);  // Dedicated for LoRa
@@ -94,6 +100,10 @@ Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 // GPS
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);
+
+// WiFi and Web Server
+WebServer server(80);
+Preferences prefs;
 
 // ======================== DATA STRUCTURES ========================
 
@@ -115,9 +125,15 @@ struct GPSData {
   bool validFix;
 };
 
+struct Config {
+  float warnOffset;
+  float critOffset;
+};
+
 // ======================== GLOBAL VARIABLES ========================
 TransmitterData transmitters[MAX_TRANSMITTERS];
 GPSData gpsData;
+Config config;
 
 char deviceID[20] = "";  // Device ID from MAC address (AW-XXXXXXXXXXXX)
 
@@ -136,6 +152,12 @@ unsigned long lastDisplayUpdate = 0;
 unsigned long lastBuzzerToggle = 0;
 bool buzzerState = false;
 
+// Display refresh control (prevents flickering)
+bool forceDisplayRedraw = true;
+DisplayMode lastDisplayMode = MODE_OVERVIEW;
+int lastTxIndex = -1;
+uint8_t lastAlarmLevel = 255;
+
 // Button state
 bool lastButtonState = HIGH;
 unsigned long lastButtonPress = 0;
@@ -144,6 +166,10 @@ bool buttonHeld = false;
 
 // SD card
 bool sdAvailable = false;
+
+// WiFi state
+bool wifiEnabled = true;
+IPAddress apIP(192, 168, 4, 1);
 
 // Display state
 enum DisplayMode {
@@ -161,6 +187,10 @@ void initSD();
 void initLEDs();
 void initBuzzer();
 void initButton();
+void initWiFi();
+void initWebServer();
+void loadConfig();
+void saveConfig();
 
 void updateLoRa();
 void updateGPS();
@@ -182,6 +212,13 @@ void drawStatusBar();
 uint16_t getAlarmColor(uint8_t level);
 int countActiveTx();
 
+// Web handlers
+void handleRoot();
+void handleLive();
+void handleConfig();
+void handleSaveConfig();
+void handleApiData();
+
 // ======================== SETUP ========================
 void setup() {
   Serial.begin(115200);
@@ -194,6 +231,9 @@ void setup() {
   Serial.println("================================");
   Serial.println();
 
+  // Load saved configuration
+  loadConfig();
+
   // Initialize all subsystems
   initLEDs();
   initButton();
@@ -205,6 +245,8 @@ void setup() {
 
   initLoRa();
   initGPS();
+  initWiFi();
+  initWebServer();
 
   // Clear transmitter data
   for (int i = 0; i < MAX_TRANSMITTERS; i++) {
@@ -223,6 +265,9 @@ void setup() {
 
 // ======================== MAIN LOOP ========================
 void loop() {
+  // Handle web server
+  server.handleClient();
+
   // Process incoming LoRa packets
   updateLoRa();
 
@@ -254,6 +299,30 @@ void loop() {
       Serial.println(" marked inactive (timeout)");
     }
   }
+}
+
+// ======================== CONFIG FUNCTIONS ========================
+
+void loadConfig() {
+  prefs.begin("axlewatch", false);
+  config.warnOffset = prefs.getFloat("warnOffset", DEFAULT_WARN_OFFSET);
+  config.critOffset = prefs.getFloat("critOffset", DEFAULT_CRIT_OFFSET);
+  prefs.end();
+
+  Serial.print("Config loaded - Warn: +");
+  Serial.print(config.warnOffset);
+  Serial.print("C, Crit: +");
+  Serial.print(config.critOffset);
+  Serial.println("C");
+}
+
+void saveConfig() {
+  prefs.begin("axlewatch", false);
+  prefs.putFloat("warnOffset", config.warnOffset);
+  prefs.putFloat("critOffset", config.critOffset);
+  prefs.end();
+
+  Serial.println("Config saved");
 }
 
 // ======================== INITIALIZATION FUNCTIONS ========================
@@ -324,13 +393,12 @@ void initDisplay() {
   Serial.println("Initializing display...");
 
   // Get MAC address for device ID
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP);
   delay(100);
   uint8_t mac[6];
   WiFi.macAddress(mac);
   snprintf(deviceID, sizeof(deviceID), "AW-%02X%02X%02X%02X%02X%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  WiFi.mode(WIFI_OFF);  // Turn off WiFi to save power
 
   Serial.println("========================================");
   Serial.print("  DEVICE ID: ");
@@ -348,33 +416,72 @@ void initDisplay() {
   // Splash screen
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(3);
-  tft.setCursor(60, 30);
+  tft.setCursor(60, 20);
   tft.print("AxleWatch");
 
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
-  tft.setCursor(95, 70);
+  tft.setCursor(95, 55);
   tft.print("Receiver");
 
   tft.setTextSize(1);
-  tft.setCursor(70, 100);
+  tft.setCursor(70, 85);
   tft.setTextColor(ST77XX_YELLOW);
   tft.print("Homebrew Edition v2.0");
 
-  // Display Device ID prominently
-  tft.setCursor(10, 130);
+  // Display Device ID
+  tft.setCursor(10, 110);
   tft.setTextColor(ST77XX_GREEN);
-  tft.print("Device ID: ");
+  tft.print("ID: ");
   tft.setTextColor(ST77XX_WHITE);
   tft.print(deviceID);
 
-  tft.setCursor(30, 150);
+  // WiFi info
+  tft.setCursor(10, 130);
   tft.setTextColor(ST77XX_CYAN);
-  tft.print("Register at AxleWatch.com");
+  tft.print("WiFi: ");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(AP_SSID);
 
-  delay(5000);  // Show splash longer so user can note ID
+  tft.setCursor(10, 150);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.print("Dashboard: ");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("http://192.168.4.1");
+
+  delay(5000);  // Show splash longer so user can note info
 
   Serial.println("  Display OK (ST7789 320x170)");
+}
+
+void initWiFi() {
+  Serial.println("Initializing WiFi AP...");
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
+
+  Serial.print("  SSID: ");
+  Serial.println(AP_SSID);
+  Serial.print("  Password: ");
+  Serial.println(AP_PASSWORD);
+  Serial.print("  IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  Serial.println("  WiFi AP OK");
+}
+
+void initWebServer() {
+  Serial.println("Initializing web server...");
+
+  server.on("/", handleRoot);
+  server.on("/live", handleLive);
+  server.on("/config", handleConfig);
+  server.on("/save", HTTP_POST, handleSaveConfig);
+  server.on("/api/data", handleApiData);
+
+  server.begin();
+  Serial.println("  Web server OK");
 }
 
 void initLoRa() {
@@ -403,9 +510,9 @@ void initLoRa() {
     Serial.println("  ERROR: LoRa init failed!");
     // Flash red LED to indicate error
     while (1) {
-      digitalWrite(LED_RED, LOW);
-      delay(200);
       digitalWrite(LED_RED, HIGH);
+      delay(200);
+      digitalWrite(LED_RED, LOW);
       delay(200);
     }
   }
@@ -436,6 +543,350 @@ void initGPS() {
   gpsData.satellites = 0;
 
   Serial.println("  GPS OK (9600 baud)");
+}
+
+// ======================== WEB HANDLERS ========================
+
+void handleRoot() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AxleWatch Receiver</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           margin: 0; padding: 20px; background: #1a1a2e; color: #eee; }
+    .container { max-width: 600px; margin: 0 auto; }
+    h1 { color: #00d4ff; text-align: center; margin-bottom: 10px; }
+    .subtitle { text-align: center; color: #888; margin-bottom: 20px; }
+    .card { background: #16213e; border-radius: 12px; padding: 20px; margin-bottom: 15px; }
+    .card h2 { margin-top: 0; color: #00d4ff; font-size: 18px; }
+    .btn { display: block; width: 100%; padding: 15px; margin: 10px 0;
+           border: none; border-radius: 8px; font-size: 16px; cursor: pointer;
+           text-decoration: none; text-align: center; }
+    .btn-primary { background: #00d4ff; color: #000; }
+    .btn-secondary { background: #0f3460; color: #fff; }
+    .info { display: flex; justify-content: space-between; padding: 8px 0;
+            border-bottom: 1px solid #0f3460; }
+    .info:last-child { border-bottom: none; }
+    .label { color: #888; }
+    .value { color: #00d4ff; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>AxleWatch</h1>
+    <p class="subtitle">Receiver Dashboard</p>
+
+    <div class="card">
+      <h2>Device Info</h2>
+      <div class="info"><span class="label">Device ID</span><span class="value">)rawliteral" + String(deviceID) + R"rawliteral(</span></div>
+      <div class="info"><span class="label">WiFi SSID</span><span class="value">)rawliteral" + String(AP_SSID) + R"rawliteral(</span></div>
+      <div class="info"><span class="label">IP Address</span><span class="value">192.168.4.1</span></div>
+    </div>
+
+    <a href="/live" class="btn btn-primary">Live Dashboard</a>
+    <a href="/config" class="btn btn-secondary">Settings</a>
+  </div>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleLive() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AxleWatch Live</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           margin: 0; padding: 10px; background: #1a1a2e; color: #eee; }
+    h1 { color: #00d4ff; text-align: center; font-size: 20px; margin: 10px 0; }
+    .status-bar { display: flex; justify-content: space-around; padding: 10px;
+                  background: #16213e; border-radius: 8px; margin-bottom: 10px; font-size: 12px; }
+    .status-item { text-align: center; }
+    .status-label { color: #888; }
+    .status-value { font-weight: bold; }
+    .ok { color: #00ff88; }
+    .warn { color: #ffaa00; }
+    .crit { color: #ff4444; }
+    .tx-card { background: #16213e; border-radius: 12px; padding: 15px; margin-bottom: 10px; }
+    .tx-header { display: flex; justify-content: space-between; margin-bottom: 10px; }
+    .tx-id { font-size: 18px; font-weight: bold; color: #00d4ff; }
+    .tx-rssi { color: #888; font-size: 12px; }
+    .temp-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .temp-cell { background: #0f3460; border-radius: 8px; padding: 10px; text-align: center; }
+    .temp-label { font-size: 11px; color: #888; }
+    .temp-value { font-size: 20px; font-weight: bold; }
+    .ambient { margin-top: 10px; text-align: center; color: #888; }
+    .no-tx { text-align: center; padding: 40px; color: #888; }
+    .refresh-info { text-align: center; color: #666; font-size: 11px; margin-top: 10px; }
+    a { color: #00d4ff; }
+  </style>
+</head>
+<body>
+  <h1>AxleWatch Live</h1>
+
+  <div class="status-bar">
+    <div class="status-item">
+      <div class="status-label">GPS</div>
+      <div class="status-value" id="gps">--</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Speed</div>
+      <div class="status-value" id="speed">-- km/h</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Active TX</div>
+      <div class="status-value" id="txcount">0</div>
+    </div>
+    <div class="status-item">
+      <div class="status-label">Status</div>
+      <div class="status-value" id="alarm">--</div>
+    </div>
+  </div>
+
+  <div id="transmitters"></div>
+
+  <p class="refresh-info">Auto-refresh every 2 seconds | <a href="/">Home</a></p>
+
+  <script>
+    function getAlarmClass(level) {
+      if (level == 2) return 'crit';
+      if (level == 1) return 'warn';
+      return 'ok';
+    }
+
+    function updateData() {
+      fetch('/api/data')
+        .then(r => r.json())
+        .then(data => {
+          // Update status bar
+          document.getElementById('gps').innerHTML = data.gps.valid ?
+            '<span class="ok">' + data.gps.sats + ' sats</span>' :
+            '<span class="warn">No Fix</span>';
+          document.getElementById('speed').textContent = data.gps.speed.toFixed(0) + ' km/h';
+          document.getElementById('txcount').textContent = data.activeTx;
+
+          let alarmEl = document.getElementById('alarm');
+          if (data.alarmLevel == 2) {
+            alarmEl.innerHTML = '<span class="crit">ALARM!</span>';
+          } else if (data.alarmLevel == 1) {
+            alarmEl.innerHTML = '<span class="warn">WARNING</span>';
+          } else {
+            alarmEl.innerHTML = '<span class="ok">OK</span>';
+          }
+
+          // Update transmitters
+          let txHtml = '';
+          if (data.transmitters.length == 0) {
+            txHtml = '<div class="no-tx">Waiting for transmitters...</div>';
+          } else {
+            data.transmitters.forEach(tx => {
+              txHtml += '<div class="tx-card">';
+              txHtml += '<div class="tx-header">';
+              txHtml += '<span class="tx-id">' + tx.id + '</span>';
+              txHtml += '<span class="tx-rssi">RSSI: ' + tx.rssi + ' dBm</span>';
+              txHtml += '</div>';
+              txHtml += '<div class="temp-grid">';
+              for (let i = 0; i < 9; i++) {
+                let temp = tx.temps[i];
+                let alarm = tx.alarms[i];
+                let tempStr = temp < 1 ? '--' : temp.toFixed(1);
+                txHtml += '<div class="temp-cell">';
+                txHtml += '<div class="temp-label">P' + (i+1) + '</div>';
+                txHtml += '<div class="temp-value ' + getAlarmClass(alarm) + '">' + tempStr + '</div>';
+                txHtml += '</div>';
+              }
+              txHtml += '</div>';
+              txHtml += '<div class="ambient">Ambient: ' + tx.ambient.toFixed(1) + '°C</div>';
+              txHtml += '</div>';
+            });
+          }
+          document.getElementById('transmitters').innerHTML = txHtml;
+        })
+        .catch(err => console.error('Error:', err));
+    }
+
+    updateData();
+    setInterval(updateData, 2000);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleConfig() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AxleWatch Settings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           margin: 0; padding: 20px; background: #1a1a2e; color: #eee; }
+    .container { max-width: 400px; margin: 0 auto; }
+    h1 { color: #00d4ff; text-align: center; }
+    .card { background: #16213e; border-radius: 12px; padding: 20px; margin-bottom: 15px; }
+    label { display: block; color: #888; margin-bottom: 5px; font-size: 14px; }
+    input { width: 100%; padding: 12px; border: 1px solid #0f3460; border-radius: 8px;
+            background: #0f3460; color: #fff; font-size: 16px; margin-bottom: 15px; }
+    .btn { display: block; width: 100%; padding: 15px; margin: 10px 0;
+           border: none; border-radius: 8px; font-size: 16px; cursor: pointer; }
+    .btn-primary { background: #00d4ff; color: #000; }
+    .btn-secondary { background: #0f3460; color: #fff; text-decoration: none; text-align: center; }
+    .hint { font-size: 12px; color: #666; margin-top: -10px; margin-bottom: 15px; }
+    .success { background: #00ff88; color: #000; padding: 10px; border-radius: 8px;
+               text-align: center; margin-bottom: 15px; display: none; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Settings</h1>
+
+    <div class="success" id="success">Settings saved!</div>
+
+    <form id="configForm">
+      <div class="card">
+        <h3 style="margin-top:0; color:#00d4ff;">Alarm Thresholds</h3>
+        <label>Warning Threshold (°C above ambient)</label>
+        <input type="number" id="warnOffset" value=")rawliteral" + String(config.warnOffset, 0) + R"rawliteral(" step="1" min="10" max="100">
+        <p class="hint">Yellow LED and slow beep when exceeded</p>
+
+        <label>Critical Threshold (°C above ambient)</label>
+        <input type="number" id="critOffset" value=")rawliteral" + String(config.critOffset, 0) + R"rawliteral(" step="1" min="20" max="150">
+        <p class="hint">Red LED and fast beep when exceeded</p>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Save Settings</button>
+    </form>
+
+    <a href="/" class="btn btn-secondary">Back to Home</a>
+  </div>
+
+  <script>
+    document.getElementById('configForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+
+      let formData = new FormData();
+      formData.append('warnOffset', document.getElementById('warnOffset').value);
+      formData.append('critOffset', document.getElementById('critOffset').value);
+
+      fetch('/save', {
+        method: 'POST',
+        body: formData
+      })
+      .then(r => r.text())
+      .then(data => {
+        document.getElementById('success').style.display = 'block';
+        setTimeout(() => {
+          document.getElementById('success').style.display = 'none';
+        }, 3000);
+      })
+      .catch(err => alert('Error saving settings'));
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleSaveConfig() {
+  if (server.hasArg("warnOffset")) {
+    config.warnOffset = server.arg("warnOffset").toFloat();
+  }
+  if (server.hasArg("critOffset")) {
+    config.critOffset = server.arg("critOffset").toFloat();
+  }
+
+  // Validate
+  if (config.warnOffset < 10) config.warnOffset = 10;
+  if (config.warnOffset > 100) config.warnOffset = 100;
+  if (config.critOffset < 20) config.critOffset = 20;
+  if (config.critOffset > 150) config.critOffset = 150;
+  if (config.critOffset <= config.warnOffset) {
+    config.critOffset = config.warnOffset + 10;
+  }
+
+  saveConfig();
+
+  server.send(200, "text/plain", "OK");
+}
+
+void handleApiData() {
+  String json = "{";
+
+  // GPS data
+  json += "\"gps\":{";
+  json += "\"valid\":" + String(gpsData.validFix ? "true" : "false") + ",";
+  json += "\"lat\":" + String(gpsData.latitude, 6) + ",";
+  json += "\"lon\":" + String(gpsData.longitude, 6) + ",";
+  json += "\"speed\":" + String(gpsData.speedKmh, 1) + ",";
+  json += "\"sats\":" + String(gpsData.satellites);
+  json += "},";
+
+  // Alarm level
+  json += "\"alarmLevel\":" + String(currentAlarmLevel) + ",";
+  json += "\"alarmMuted\":" + String(alarmMuted ? "true" : "false") + ",";
+
+  // Active transmitter count
+  int txCount = countActiveTx();
+  json += "\"activeTx\":" + String(txCount) + ",";
+
+  // Transmitters array
+  json += "\"transmitters\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_TRANSMITTERS; i++) {
+    if (transmitters[i].active) {
+      if (!first) json += ",";
+      first = false;
+
+      json += "{";
+      json += "\"id\":\"" + String(transmitters[i].txID) + "\",";
+      json += "\"rssi\":" + String(transmitters[i].rssi) + ",";
+      json += "\"ambient\":" + String(transmitters[i].ambientTemp, 1) + ",";
+
+      json += "\"temps\":[";
+      for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
+        if (j > 0) json += ",";
+        json += String(transmitters[i].temps[j], 1);
+      }
+      json += "],";
+
+      json += "\"alarms\":[";
+      for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
+        if (j > 0) json += ",";
+        json += String(transmitters[i].alarmLevels[j]);
+      }
+      json += "]";
+
+      json += "}";
+    }
+  }
+  json += "]";
+
+  // Config
+  json += ",\"config\":{";
+  json += "\"warnOffset\":" + String(config.warnOffset, 1) + ",";
+  json += "\"critOffset\":" + String(config.critOffset, 1);
+  json += "}";
+
+  json += "}";
+
+  server.send(200, "application/json", json);
 }
 
 // ======================== UPDATE FUNCTIONS ========================
@@ -507,6 +958,9 @@ void updateLoRa() {
 
     // Log to SD
     logToSD(&transmitters[slot]);
+
+    // Trigger display update
+    forceDisplayRedraw = true;
   } else {
     Serial.println("  No available slot!");
   }
@@ -612,10 +1066,10 @@ void updateAlarms() {
 
       float delta = temp - ambient;
 
-      if (delta >= DEFAULT_CRIT_OFFSET) {
+      if (delta >= config.critOffset) {
         transmitters[i].alarmLevels[j] = 2;
         if (maxLevel < 2) maxLevel = 2;
-      } else if (delta >= DEFAULT_WARN_OFFSET) {
+      } else if (delta >= config.warnOffset) {
         transmitters[i].alarmLevels[j] = 1;
         if (maxLevel < 1) maxLevel = 1;
       } else {
@@ -702,11 +1156,11 @@ void handleButton() {
         Serial.print("Display mode: ");
         Serial.println(displayMode);
       }
-      lastDisplayUpdate = 0;  // Force redraw
+      forceDisplayRedraw = true;  // Force redraw
     } else if (!buttonHeld) {
       // Long press (1+ seconds) - cycle to next transmitter
       cycleTx();
-      lastDisplayUpdate = 0;  // Force redraw
+      forceDisplayRedraw = true;  // Force redraw
     }
 
     lastButtonPress = millis();
@@ -734,15 +1188,33 @@ void cycleTx() {
 }
 
 void updateDisplay() {
-  // Rate limit display updates
-  if (millis() - lastDisplayUpdate < 1000) return;
+  // Rate limit display updates (check every 500ms, but only redraw when needed)
+  if (millis() - lastDisplayUpdate < 500) return;
   lastDisplayUpdate = millis();
 
   // Auto-cycle transmitters in overview mode
   if (displayMode == MODE_OVERVIEW && millis() - lastDisplayCycle >= DISPLAY_CYCLE_INTERVAL) {
+    int oldIdx = currentTxIndex;
     cycleTx();
+    if (currentTxIndex != oldIdx) {
+      forceDisplayRedraw = true;
+    }
     lastDisplayCycle = millis();
   }
+
+  // Check if we need to redraw (mode changed, TX changed, or alarm level changed)
+  bool needsRedraw = forceDisplayRedraw ||
+                     (displayMode != lastDisplayMode) ||
+                     (currentTxIndex != lastTxIndex) ||
+                     (currentAlarmLevel != lastAlarmLevel);
+
+  if (!needsRedraw) return;
+
+  // Update tracking variables
+  lastDisplayMode = displayMode;
+  lastTxIndex = currentTxIndex;
+  lastAlarmLevel = currentAlarmLevel;
+  forceDisplayRedraw = false;
 
   // Draw appropriate screen
   switch (displayMode) {
@@ -793,30 +1265,25 @@ void drawStatusBar() {
   }
 
   // Speed
-  tft.setCursor(70, 6);
+  tft.setCursor(60, 6);
   tft.setTextColor(ST77XX_CYAN);
   tft.print(gpsData.speedKmh, 0);
   tft.print("km/h");
 
-  // SD status
-  tft.setCursor(130, 6);
-  if (sdAvailable) {
-    tft.setTextColor(ST77XX_GREEN);
-    tft.print("SD OK");
-  } else {
-    tft.setTextColor(ST77XX_RED);
-    tft.print("NO SD");
-  }
+  // WiFi indicator
+  tft.setCursor(115, 6);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.print("WiFi");
 
   // Active TX count
   int txCount = countActiveTx();
-  tft.setCursor(180, 6);
+  tft.setCursor(155, 6);
   tft.setTextColor(ST77XX_WHITE);
   tft.print("TX:");
   tft.print(txCount);
 
   // Alarm status
-  tft.setCursor(220, 6);
+  tft.setCursor(195, 6);
   if (alarmMuted) {
     tft.setTextColor(ST77XX_ORANGE);
     tft.print("MUTED");
@@ -832,7 +1299,7 @@ void drawStatusBar() {
   }
 
   // Mode indicator
-  tft.setCursor(280, 6);
+  tft.setCursor(260, 6);
   tft.setTextColor(ST77XX_MAGENTA);
   switch (displayMode) {
     case MODE_OVERVIEW: tft.print("[OVR]"); break;
@@ -852,13 +1319,17 @@ void drawOverviewScreen() {
     // No transmitters
     tft.setTextSize(2);
     tft.setTextColor(ST77XX_YELLOW);
-    tft.setCursor(40, 70);
+    tft.setCursor(40, 55);
     tft.print("Waiting for TX...");
 
     tft.setTextSize(1);
     tft.setTextColor(ST77XX_WHITE);
-    tft.setCursor(60, 110);
+    tft.setCursor(50, 90);
     tft.print("Listening on 433 MHz");
+
+    tft.setCursor(35, 110);
+    tft.setTextColor(ST77XX_CYAN);
+    tft.print("Phone: http://192.168.4.1");
     return;
   }
 
@@ -999,15 +1470,23 @@ void drawStatusScreen() {
   tft.print("System Status");
 
   tft.setTextSize(1);
-  int y = 50;
-  int lineHeight = 18;
+  int y = 48;
+  int lineHeight = 16;
 
-  // LoRa
+  // WiFi
   tft.setCursor(10, y);
   tft.setTextColor(ST77XX_WHITE);
-  tft.print("LoRa: ");
+  tft.print("WiFi: ");
   tft.setTextColor(ST77XX_GREEN);
-  tft.print("433MHz SF7 125kHz");
+  tft.print(AP_SSID);
+  y += lineHeight;
+
+  // IP
+  tft.setCursor(10, y);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("Dashboard: ");
+  tft.setTextColor(ST77XX_CYAN);
+  tft.print("http://192.168.4.1");
   y += lineHeight;
 
   // GPS
@@ -1016,66 +1495,39 @@ void drawStatusScreen() {
   tft.print("GPS: ");
   if (gpsData.validFix) {
     tft.setTextColor(ST77XX_GREEN);
-    tft.print(gpsData.latitude, 5);
-    tft.print(", ");
-    tft.print(gpsData.longitude, 5);
+    tft.print(gpsData.satellites);
+    tft.print(" sats, ");
+    tft.print(gpsData.speedKmh, 0);
+    tft.print(" km/h");
   } else {
     tft.setTextColor(ST77XX_YELLOW);
-    tft.print("Acquiring... (");
-    tft.print(gpsData.satellites);
-    tft.print(" sats)");
+    tft.print("Acquiring...");
   }
   y += lineHeight;
 
-  // Speed
+  // Thresholds
   tft.setCursor(10, y);
   tft.setTextColor(ST77XX_WHITE);
-  tft.print("Speed: ");
-  tft.setTextColor(ST77XX_CYAN);
-  tft.print(gpsData.speedKmh, 1);
-  tft.print(" km/h");
-  y += lineHeight;
-
-  // SD Card
-  tft.setCursor(10, y);
+  tft.print("Warn: +");
+  tft.setTextColor(ST77XX_YELLOW);
+  tft.print(config.warnOffset, 0);
   tft.setTextColor(ST77XX_WHITE);
-  tft.print("SD Card: ");
-  if (sdAvailable) {
-    tft.setTextColor(ST77XX_GREEN);
-    tft.print("Logging active");
-  } else {
-    tft.setTextColor(ST77XX_RED);
-    tft.print("Not available");
-  }
+  tft.print("C  Crit: +");
+  tft.setTextColor(ST77XX_RED);
+  tft.print(config.critOffset, 0);
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print("C");
   y += lineHeight;
 
-  // Active transmitters
+  // Active TX
   tft.setCursor(10, y);
   tft.setTextColor(ST77XX_WHITE);
   tft.print("Active TX: ");
   tft.setTextColor(ST77XX_CYAN);
-  int count = countActiveTx();
-  tft.print(count);
-  tft.print("/");
-  tft.print(MAX_TRANSMITTERS);
+  tft.print(countActiveTx());
   y += lineHeight;
 
-  // List active TX IDs
-  if (count > 0) {
-    tft.setCursor(10, y);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print("IDs: ");
-    tft.setTextColor(ST77XX_GREEN);
-    for (int i = 0; i < MAX_TRANSMITTERS; i++) {
-      if (transmitters[i].active) {
-        tft.print(transmitters[i].txID);
-        tft.print(" ");
-      }
-    }
-  }
-  y += lineHeight;
-
-  // Device ID (for registration)
+  // Device ID
   tft.setCursor(10, y);
   tft.setTextColor(ST77XX_WHITE);
   tft.print("ID: ");
