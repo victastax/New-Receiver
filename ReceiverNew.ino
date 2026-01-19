@@ -19,6 +19,7 @@
 
 // ======================== INCLUDES ========================
 #include <SPI.h>
+#include <WiFi.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <LoRa.h>
@@ -117,6 +118,8 @@ struct GPSData {
 // ======================== GLOBAL VARIABLES ========================
 TransmitterData transmitters[MAX_TRANSMITTERS];
 GPSData gpsData;
+
+char deviceID[20] = "";  // Device ID from MAC address (AW-XXXXXXXXXXXX)
 
 int currentTxIndex = 0;
 int activeTxCount = 0;
@@ -320,6 +323,21 @@ void initSD() {
 void initDisplay() {
   Serial.println("Initializing display...");
 
+  // Get MAC address for device ID
+  WiFi.mode(WIFI_STA);
+  delay(100);
+  uint8_t mac[6];
+  WiFi.macAddress(mac);
+  snprintf(deviceID, sizeof(deviceID), "AW-%02X%02X%02X%02X%02X%02X",
+           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  WiFi.mode(WIFI_OFF);  // Turn off WiFi to save power
+
+  Serial.println("========================================");
+  Serial.print("  DEVICE ID: ");
+  Serial.println(deviceID);
+  Serial.println("  (Use this to register on AxleWatch.com)");
+  Serial.println("========================================");
+
   // NOTE: Tie TFT backlight (BL) directly to 3.3V
 
   // Initialize ST7789 (320x170)
@@ -330,20 +348,31 @@ void initDisplay() {
   // Splash screen
   tft.setTextColor(ST77XX_CYAN);
   tft.setTextSize(3);
-  tft.setCursor(60, 50);
+  tft.setCursor(60, 30);
   tft.print("AxleWatch");
 
   tft.setTextColor(ST77XX_WHITE);
   tft.setTextSize(2);
-  tft.setCursor(95, 90);
+  tft.setCursor(95, 70);
   tft.print("Receiver");
 
   tft.setTextSize(1);
-  tft.setCursor(90, 130);
+  tft.setCursor(70, 100);
   tft.setTextColor(ST77XX_YELLOW);
   tft.print("Homebrew Edition v2.0");
 
-  delay(2000);
+  // Display Device ID prominently
+  tft.setCursor(10, 130);
+  tft.setTextColor(ST77XX_GREEN);
+  tft.print("Device ID: ");
+  tft.setTextColor(ST77XX_WHITE);
+  tft.print(deviceID);
+
+  tft.setCursor(30, 150);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.print("Register at AxleWatch.com");
+
+  delay(5000);  // Show splash longer so user can note ID
 
   Serial.println("  Display OK (ST7789 320x170)");
 }
@@ -1046,14 +1075,12 @@ void drawStatusScreen() {
   }
   y += lineHeight;
 
-  // Alarm thresholds
+  // Device ID (for registration)
   tft.setCursor(10, y);
   tft.setTextColor(ST77XX_WHITE);
-  tft.print("Warn: +");
-  tft.print(DEFAULT_WARN_OFFSET, 0);
-  tft.print("C  Crit: +");
-  tft.print(DEFAULT_CRIT_OFFSET, 0);
-  tft.print("C");
+  tft.print("ID: ");
+  tft.setTextColor(ST77XX_GREEN);
+  tft.print(deviceID);
 }
 
 // ======================== SD LOGGING ========================
