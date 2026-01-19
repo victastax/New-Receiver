@@ -131,6 +131,14 @@ struct Config {
 };
 
 // ======================== GLOBAL VARIABLES ========================
+
+// Display mode enum (must be defined before use)
+enum DisplayMode {
+  MODE_OVERVIEW,    // Shows current TX temps
+  MODE_DETAIL,      // Shows all 9 positions for current TX
+  MODE_STATUS       // Shows system status (GPS, SD, etc)
+};
+
 TransmitterData transmitters[MAX_TRANSMITTERS];
 GPSData gpsData;
 Config config;
@@ -179,11 +187,6 @@ bool wifiEnabled = true;
 IPAddress apIP(192, 168, 4, 1);
 
 // Display state
-enum DisplayMode {
-  MODE_OVERVIEW,    // Shows current TX temps
-  MODE_DETAIL,      // Shows all 9 positions for current TX
-  MODE_STATUS       // Shows system status (GPS, SD, etc)
-};
 DisplayMode displayMode = MODE_OVERVIEW;
 
 // ======================== FUNCTION PROTOTYPES ========================
