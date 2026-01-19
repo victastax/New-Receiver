@@ -61,7 +61,7 @@
 #define LED_RED         17
 
 // ============= BUZZER PIN =============
-#define BUZZER_PIN      3   // GPIO3 (RX0) - moved from GPIO25 (DAC) to avoid static
+#define BUZZER_PIN      0   // GPIO0 - boot pin but safe with piezo (has internal pull-up)
 
 // ============= BUTTON PIN =============
 #define BUTTON_PIN      35    // Requires external 10k pull-up
