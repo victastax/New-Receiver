@@ -35,7 +35,7 @@
 #define TFT_RST         4
 #define TFT_MOSI        23
 #define TFT_SCK         18
-#define TFT_BL          22    // Backlight (optional, can tie to 3.3V)
+// NOTE: TFT Backlight - tie directly to 3.3V (no GPIO control needed)
 
 // ============= LORA PINS (HSPI) =============
 #define LORA_CS         5
@@ -53,7 +53,7 @@
 #define GPS_RX          34    // ESP32 RX <- GPS TX
 #define GPS_TX          32    // ESP32 TX -> GPS RX
 
-// ============= LED PINS (Active LOW) =============
+// ============= LED PINS (Active HIGH - GPIO -> resistor -> LED -> GND) =============
 #define LED_GREEN       21
 #define LED_YELLOW      22
 #define LED_RED         17
@@ -261,20 +261,21 @@ void initLEDs() {
   pinMode(LED_YELLOW, OUTPUT);
   pinMode(LED_RED, OUTPUT);
 
-  // LEDs are active LOW - turn all off
-  digitalWrite(LED_GREEN, HIGH);
-  digitalWrite(LED_YELLOW, HIGH);
-  digitalWrite(LED_RED, HIGH);
+  // LEDs are active HIGH - turn all off
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW);
 
   // Quick LED test
-  digitalWrite(LED_RED, LOW);
-  delay(200);
   digitalWrite(LED_RED, HIGH);
-  digitalWrite(LED_YELLOW, LOW);
   delay(200);
+  digitalWrite(LED_RED, LOW);
   digitalWrite(LED_YELLOW, HIGH);
-  digitalWrite(LED_GREEN, LOW);
   delay(200);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_GREEN, HIGH);
+  delay(200);
+  digitalWrite(LED_GREEN, LOW);  // All off after test
 
   Serial.println("  LEDs OK");
 }
@@ -319,9 +320,7 @@ void initSD() {
 void initDisplay() {
   Serial.println("Initializing display...");
 
-  // Backlight on
-  pinMode(TFT_BL, OUTPUT);
-  digitalWrite(TFT_BL, HIGH);
+  // NOTE: Tie TFT backlight (BL) directly to 3.3V
 
   // Initialize ST7789 (320x170)
   tft.init(170, 320);
@@ -606,21 +605,21 @@ void updateAlarms() {
 }
 
 void updateLEDs() {
-  // Turn off all LEDs first (active LOW)
-  digitalWrite(LED_GREEN, HIGH);
-  digitalWrite(LED_YELLOW, HIGH);
-  digitalWrite(LED_RED, HIGH);
+  // Turn off all LEDs first (active HIGH)
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_YELLOW, LOW);
+  digitalWrite(LED_RED, LOW);
 
   // Light appropriate LED based on alarm level
   switch (currentAlarmLevel) {
     case 2:  // Critical
-      digitalWrite(LED_RED, LOW);
+      digitalWrite(LED_RED, HIGH);
       break;
     case 1:  // Warning
-      digitalWrite(LED_YELLOW, LOW);
+      digitalWrite(LED_YELLOW, HIGH);
       break;
     default:  // OK
-      digitalWrite(LED_GREEN, LOW);
+      digitalWrite(LED_GREEN, HIGH);
       break;
   }
 }
