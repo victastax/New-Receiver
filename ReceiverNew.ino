@@ -378,15 +378,16 @@ void initBuzzer() {
   // Set pin low initially
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
+  dacWrite(BUZZER_PIN, 0);  // Ensure DAC is at 0
 
   // Quick beep test using PWM
   ledcAttach(BUZZER_PIN, 2000, 8);
-  ledcWriteTone(BUZZER_PIN, 2000);
   ledcWrite(BUZZER_PIN, 128);
   delay(100);
 
-  // Detach PWM and set pin low to prevent static
+  // Detach PWM and silence completely
   ledcDetach(BUZZER_PIN);
+  dacWrite(BUZZER_PIN, 0);  // Set DAC to 0
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 
@@ -1132,6 +1133,7 @@ void updateLEDs() {
 // Silence the buzzer pin completely
 void buzzerSilence() {
   ledcDetach(BUZZER_PIN);
+  dacWrite(BUZZER_PIN, 0);  // GPIO 25 is DAC1 - set to 0
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
 }
