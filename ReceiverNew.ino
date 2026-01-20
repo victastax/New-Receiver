@@ -463,13 +463,11 @@ void initSD() {
 void initDisplay() {
   Serial.println("Initializing display...");
 
-  // Get MAC address for device ID
-  WiFi.mode(WIFI_AP);
-  delay(100);
-  uint8_t mac[6];
-  WiFi.macAddress(mac);
+  // Get MAC address for device ID (from chip's efuse - always available)
+  uint64_t chipid = ESP.getEfuseMac();
   snprintf(deviceID, sizeof(deviceID), "AW-%02X%02X%02X%02X%02X%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+           (uint8_t)(chipid), (uint8_t)(chipid >> 8), (uint8_t)(chipid >> 16),
+           (uint8_t)(chipid >> 24), (uint8_t)(chipid >> 32), (uint8_t)(chipid >> 40));
 
   Serial.println("========================================");
   Serial.print("  DEVICE ID: ");
