@@ -27,6 +27,7 @@
 #include <TinyGPS++.h>
 #include <SD.h>
 #include <FS.h>
+#include <HTTPClient.h>
 
 // ======================== PIN DEFINITIONS ========================
 // ESP32-WROOM-32 Pin Assignments - AxleWatch Homebrew Receiver
@@ -61,7 +62,7 @@
 #define LED_RED         17
 
 // ============= BUZZER PIN =============
-#define BUZZER_PIN      25
+#define BUZZER_PIN      0   // GPIO0 - boot pin but safe with piezo (has internal pull-up)
 
 // ============= BUTTON PIN =============
 #define BUTTON_PIN      35    // Requires external 10k pull-up
@@ -128,6 +129,10 @@ struct GPSData {
 struct Config {
   float warnOffset;
   float critOffset;
+  char wifiSSID[64];       // Truck's WiFi SSID (e.g., Starlink)
+  char wifiPassword[64];   // WiFi password
+  char dashboardURL[128];  // Dashboard API endpoint
+  bool wifiEnabled;        // Enable WiFi client mode
 };
 
 // ======================== GLOBAL VARIABLES ========================
@@ -183,8 +188,15 @@ bool buttonHeld = false;
 bool sdAvailable = false;
 
 // WiFi state
-bool wifiEnabled = true;
+bool apModeActive = true;  // AP mode for local config
 IPAddress apIP(192, 168, 4, 1);
+
+// WiFi Client state (for connecting to truck's WiFi)
+bool wifiClientConnected = false;
+unsigned long lastDashboardUpdate = 0;
+unsigned long lastWifiReconnectAttempt = 0;
+#define DASHBOARD_UPDATE_INTERVAL 5000   // Send data every 5 seconds
+#define WIFI_RECONNECT_INTERVAL   30000  // Retry connection every 30 seconds
 
 // Display state
 DisplayMode displayMode = MODE_OVERVIEW;
@@ -208,6 +220,7 @@ void updateDisplay();
 void updateAlarms();
 void updateLEDs();
 void updateBuzzer();
+void buzzerSilence();
 void buzzerOff();
 void buzzerWarning();
 void buzzerAlarm();
@@ -230,7 +243,13 @@ void handleRoot();
 void handleLive();
 void handleConfig();
 void handleSaveConfig();
+void handleWifiConfig();
+void handleSaveWifi();
 void handleApiData();
+
+// WiFi/Dashboard
+void connectToWiFi();
+void sendToDashboard();
 
 // ======================== SETUP ========================
 void setup() {
@@ -312,6 +331,12 @@ void loop() {
       Serial.println(" marked inactive (timeout)");
     }
   }
+
+  // Maintain WiFi client connection
+  connectToWiFi();
+
+  // Send data to dashboard
+  sendToDashboard();
 }
 
 // ======================== CONFIG FUNCTIONS ========================
@@ -320,6 +345,17 @@ void loadConfig() {
   prefs.begin("axlewatch", false);
   config.warnOffset = prefs.getFloat("warnOffset", DEFAULT_WARN_OFFSET);
   config.critOffset = prefs.getFloat("critOffset", DEFAULT_CRIT_OFFSET);
+  config.wifiEnabled = prefs.getBool("wifiEnabled", false);
+
+  // Load WiFi credentials
+  String ssid = prefs.getString("wifiSSID", "");
+  String pass = prefs.getString("wifiPass", "");
+  String url = prefs.getString("dashURL", "");
+
+  strncpy(config.wifiSSID, ssid.c_str(), sizeof(config.wifiSSID) - 1);
+  strncpy(config.wifiPassword, pass.c_str(), sizeof(config.wifiPassword) - 1);
+  strncpy(config.dashboardURL, url.c_str(), sizeof(config.dashboardURL) - 1);
+
   prefs.end();
 
   Serial.print("Config loaded - Warn: +");
@@ -327,12 +363,21 @@ void loadConfig() {
   Serial.print("C, Crit: +");
   Serial.print(config.critOffset);
   Serial.println("C");
+
+  if (config.wifiEnabled && strlen(config.wifiSSID) > 0) {
+    Serial.print("WiFi Client: ");
+    Serial.println(config.wifiSSID);
+  }
 }
 
 void saveConfig() {
   prefs.begin("axlewatch", false);
   prefs.putFloat("warnOffset", config.warnOffset);
   prefs.putFloat("critOffset", config.critOffset);
+  prefs.putBool("wifiEnabled", config.wifiEnabled);
+  prefs.putString("wifiSSID", config.wifiSSID);
+  prefs.putString("wifiPass", config.wifiPassword);
+  prefs.putString("dashURL", config.dashboardURL);
   prefs.end();
 
   Serial.println("Config saved");
@@ -380,11 +425,10 @@ void initBuzzer() {
 
   // Quick beep test using PWM
   ledcAttach(BUZZER_PIN, 2000, 8);
-  ledcWriteTone(BUZZER_PIN, 2000);
   ledcWrite(BUZZER_PIN, 128);
   delay(100);
 
-  // Detach PWM and set pin low to prevent static
+  // Detach PWM and silence completely
   ledcDetach(BUZZER_PIN);
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -476,20 +520,86 @@ void initDisplay() {
 }
 
 void initWiFi() {
-  Serial.println("Initializing WiFi AP...");
+  Serial.println("Initializing WiFi...");
 
-  WiFi.mode(WIFI_AP);
+  // Use AP+STA mode if client WiFi is configured, otherwise just AP
+  if (config.wifiEnabled && strlen(config.wifiSSID) > 0) {
+    WiFi.mode(WIFI_AP_STA);
+    Serial.println("  Mode: AP + Station");
+  } else {
+    WiFi.mode(WIFI_AP);
+    Serial.println("  Mode: AP only");
+  }
+
+  // Start Access Point (always available for local config)
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL);
 
-  Serial.print("  SSID: ");
+  Serial.print("  AP SSID: ");
   Serial.println(AP_SSID);
-  Serial.print("  Password: ");
-  Serial.println(AP_PASSWORD);
-  Serial.print("  IP: ");
+  Serial.print("  AP IP: ");
   Serial.println(WiFi.softAPIP());
 
-  Serial.println("  WiFi AP OK");
+  // Connect to truck's WiFi if configured
+  if (config.wifiEnabled && strlen(config.wifiSSID) > 0) {
+    Serial.print("  Connecting to: ");
+    Serial.println(config.wifiSSID);
+
+    WiFi.begin(config.wifiSSID, config.wifiPassword);
+
+    // Wait up to 10 seconds for connection
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(500);
+      Serial.print(".");
+      attempts++;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+      wifiClientConnected = true;
+      Serial.println();
+      Serial.print("  Connected! IP: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println();
+      Serial.println("  Failed to connect - will retry later");
+    }
+  }
+
+  Serial.println("  WiFi OK");
+}
+
+void connectToWiFi() {
+  // Try to reconnect to truck's WiFi
+  if (!config.wifiEnabled || strlen(config.wifiSSID) == 0) {
+    return;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiClientConnected = true;
+    return;
+  }
+
+  unsigned long now = millis();
+  if (now - lastWifiReconnectAttempt < WIFI_RECONNECT_INTERVAL) {
+    return;
+  }
+  lastWifiReconnectAttempt = now;
+
+  Serial.print("Reconnecting to WiFi: ");
+  Serial.println(config.wifiSSID);
+
+  WiFi.begin(config.wifiSSID, config.wifiPassword);
+
+  // Brief wait
+  delay(1000);
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiClientConnected = true;
+    Serial.println("WiFi reconnected!");
+  } else {
+    wifiClientConnected = false;
+  }
 }
 
 void initWebServer() {
@@ -499,6 +609,8 @@ void initWebServer() {
   server.on("/live", handleLive);
   server.on("/config", handleConfig);
   server.on("/save", HTTP_POST, handleSaveConfig);
+  server.on("/wifi", handleWifiConfig);
+  server.on("/savewifi", HTTP_POST, handleSaveWifi);
   server.on("/api/data", handleApiData);
 
   server.begin();
@@ -604,12 +716,14 @@ void handleRoot() {
     <div class="card">
       <h2>Device Info</h2>
       <div class="info"><span class="label">Device ID</span><span class="value">)rawliteral" + String(deviceID) + R"rawliteral(</span></div>
-      <div class="info"><span class="label">WiFi SSID</span><span class="value">)rawliteral" + String(AP_SSID) + R"rawliteral(</span></div>
-      <div class="info"><span class="label">IP Address</span><span class="value">192.168.4.1</span></div>
+      <div class="info"><span class="label">AP SSID</span><span class="value">)rawliteral" + String(AP_SSID) + R"rawliteral(</span></div>
+      <div class="info"><span class="label">AP IP</span><span class="value">192.168.4.1</span></div>
+      <div class="info"><span class="label">WiFi Client</span><span class="value" style="color:)rawliteral" + String(wifiClientConnected ? "#00ff88" : "#ff4444") + R"rawliteral(">)rawliteral" + String(wifiClientConnected ? "Connected" : "Not Connected") + R"rawliteral(</span></div>
     </div>
 
     <a href="/live" class="btn btn-primary">Live Dashboard</a>
-    <a href="/config" class="btn btn-secondary">Settings</a>
+    <a href="/config" class="btn btn-secondary">Alarm Settings</a>
+    <a href="/wifi" class="btn btn-secondary">WiFi Settings</a>
   </div>
 </body>
 </html>
@@ -847,6 +961,134 @@ void handleSaveConfig() {
   server.send(200, "text/plain", "OK");
 }
 
+void handleWifiConfig() {
+  String html = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AxleWatch WiFi Settings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+           margin: 0; padding: 20px; background: #1a1a2e; color: #eee; }
+    .container { max-width: 400px; margin: 0 auto; }
+    h1 { color: #00d4ff; text-align: center; }
+    .card { background: #16213e; border-radius: 12px; padding: 20px; margin-bottom: 15px; }
+    label { display: block; color: #888; margin-bottom: 5px; font-size: 14px; }
+    input[type="text"], input[type="password"], input[type="url"] {
+      width: 100%; padding: 12px; border: 1px solid #0f3460; border-radius: 8px;
+      background: #0f3460; color: #fff; font-size: 16px; margin-bottom: 15px; }
+    .toggle { display: flex; align-items: center; gap: 10px; margin-bottom: 15px; }
+    .toggle input { width: auto; margin: 0; }
+    .btn { display: block; width: 100%; padding: 15px; margin: 10px 0;
+           border: none; border-radius: 8px; font-size: 16px; cursor: pointer; }
+    .btn-primary { background: #00d4ff; color: #000; }
+    .btn-secondary { background: #0f3460; color: #fff; text-decoration: none; text-align: center; }
+    .hint { font-size: 12px; color: #666; margin-top: -10px; margin-bottom: 15px; }
+    .success { background: #00ff88; color: #000; padding: 10px; border-radius: 8px;
+               text-align: center; margin-bottom: 15px; display: none; }
+    .status { padding: 10px; border-radius: 8px; margin-bottom: 15px; text-align: center; }
+    .connected { background: #00ff88; color: #000; }
+    .disconnected { background: #ff4444; color: #fff; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>WiFi Settings</h1>
+
+    <div class="success" id="success">Settings saved! Device will reconnect...</div>
+
+    <div class="status )rawliteral" + String(wifiClientConnected ? "connected" : "disconnected") + R"rawliteral(">
+      )rawliteral" + String(wifiClientConnected ? "Connected to WiFi" : "Not connected to WiFi") + R"rawliteral(
+    </div>
+
+    <form id="wifiForm">
+      <div class="card">
+        <h3 style="margin-top:0; color:#00d4ff;">Truck WiFi (Starlink)</h3>
+
+        <div class="toggle">
+          <input type="checkbox" id="wifiEnabled" )rawliteral" + String(config.wifiEnabled ? "checked" : "") + R"rawliteral(>
+          <label style="margin:0; color:#fff;">Enable WiFi Connection</label>
+        </div>
+
+        <label>WiFi Network Name (SSID)</label>
+        <input type="text" id="wifiSSID" value=")rawliteral" + String(config.wifiSSID) + R"rawliteral(" placeholder="Enter WiFi name">
+
+        <label>WiFi Password</label>
+        <input type="password" id="wifiPassword" value=")rawliteral" + String(config.wifiPassword) + R"rawliteral(" placeholder="Enter password">
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top:0; color:#00d4ff;">Dashboard API</h3>
+
+        <label>Dashboard URL</label>
+        <input type="url" id="dashboardURL" value=")rawliteral" + String(config.dashboardURL) + R"rawliteral(" placeholder="https://your-dashboard.com/api/data">
+        <p class="hint">The API endpoint where temperature data will be sent</p>
+      </div>
+
+      <button type="submit" class="btn btn-primary">Save WiFi Settings</button>
+    </form>
+
+    <a href="/" class="btn btn-secondary">Back to Home</a>
+  </div>
+
+  <script>
+    document.getElementById('wifiForm').addEventListener('submit', function(e) {
+      e.preventDefault();
+
+      let formData = new FormData();
+      formData.append('wifiEnabled', document.getElementById('wifiEnabled').checked ? '1' : '0');
+      formData.append('wifiSSID', document.getElementById('wifiSSID').value);
+      formData.append('wifiPassword', document.getElementById('wifiPassword').value);
+      formData.append('dashboardURL', document.getElementById('dashboardURL').value);
+
+      fetch('/savewifi', {
+        method: 'POST',
+        body: formData
+      })
+      .then(r => r.text())
+      .then(data => {
+        document.getElementById('success').style.display = 'block';
+        setTimeout(() => {
+          window.location.reload();
+        }, 3000);
+      })
+      .catch(err => alert('Error saving settings'));
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+  server.send(200, "text/html", html);
+}
+
+void handleSaveWifi() {
+  if (server.hasArg("wifiEnabled")) {
+    config.wifiEnabled = (server.arg("wifiEnabled") == "1");
+  }
+  if (server.hasArg("wifiSSID")) {
+    strncpy(config.wifiSSID, server.arg("wifiSSID").c_str(), sizeof(config.wifiSSID) - 1);
+  }
+  if (server.hasArg("wifiPassword")) {
+    strncpy(config.wifiPassword, server.arg("wifiPassword").c_str(), sizeof(config.wifiPassword) - 1);
+  }
+  if (server.hasArg("dashboardURL")) {
+    strncpy(config.dashboardURL, server.arg("dashboardURL").c_str(), sizeof(config.dashboardURL) - 1);
+  }
+
+  saveConfig();
+
+  // Attempt to connect with new credentials
+  if (config.wifiEnabled && strlen(config.wifiSSID) > 0) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(config.wifiSSID, config.wifiPassword);
+  }
+
+  server.send(200, "text/plain", "OK");
+}
+
 void handleApiData() {
   String json = "{";
 
@@ -908,6 +1150,101 @@ void handleApiData() {
   json += "}";
 
   server.send(200, "application/json", json);
+}
+
+// ======================== DASHBOARD FUNCTIONS ========================
+
+void sendToDashboard() {
+  // Only send if connected and configured
+  if (!wifiClientConnected || !config.wifiEnabled) {
+    return;
+  }
+
+  if (strlen(config.dashboardURL) == 0) {
+    return;
+  }
+
+  // Rate limit
+  unsigned long now = millis();
+  if (now - lastDashboardUpdate < DASHBOARD_UPDATE_INTERVAL) {
+    return;
+  }
+  lastDashboardUpdate = now;
+
+  // Check WiFi status
+  if (WiFi.status() != WL_CONNECTED) {
+    wifiClientConnected = false;
+    return;
+  }
+
+  // Build JSON payload
+  String json = "{";
+  json += "\"deviceId\":\"" + String(deviceID) + "\",";
+
+  // GPS data
+  json += "\"gps\":{";
+  json += "\"valid\":" + String(gpsData.validFix ? "true" : "false") + ",";
+  json += "\"lat\":" + String(gpsData.latitude, 6) + ",";
+  json += "\"lon\":" + String(gpsData.longitude, 6) + ",";
+  json += "\"speed\":" + String(gpsData.speedKmh, 1) + ",";
+  json += "\"sats\":" + String(gpsData.satellites);
+  json += "},";
+
+  // Alarm status
+  json += "\"alarmLevel\":" + String(currentAlarmLevel) + ",";
+
+  // Transmitters
+  json += "\"transmitters\":[";
+  bool first = true;
+  for (int i = 0; i < MAX_TRANSMITTERS; i++) {
+    if (transmitters[i].active) {
+      if (!first) json += ",";
+      first = false;
+
+      json += "{";
+      json += "\"id\":\"" + String(transmitters[i].txID) + "\",";
+      json += "\"rssi\":" + String(transmitters[i].rssi) + ",";
+      json += "\"ambient\":" + String(transmitters[i].ambientTemp, 1) + ",";
+
+      json += "\"temps\":[";
+      for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
+        if (j > 0) json += ",";
+        json += String(transmitters[i].temps[j], 1);
+      }
+      json += "],";
+
+      json += "\"alarms\":[";
+      for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
+        if (j > 0) json += ",";
+        json += String(transmitters[i].alarmLevels[j]);
+      }
+      json += "]";
+      json += "}";
+    }
+  }
+  json += "]";
+  json += "}";
+
+  // Send HTTP POST
+  HTTPClient http;
+  http.begin(config.dashboardURL);
+  http.addHeader("Content-Type", "application/json");
+
+  int httpCode = http.POST(json);
+
+  if (httpCode > 0) {
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("Dashboard update sent successfully");
+    } else {
+      Serial.print("Dashboard HTTP error: ");
+      Serial.println(httpCode);
+    }
+  } else {
+    Serial.print("Dashboard connection failed: ");
+    Serial.println(http.errorToString(httpCode));
+  }
+
+  http.end();
 }
 
 // ======================== UPDATE FUNCTIONS ========================
@@ -1128,20 +1465,22 @@ void updateLEDs() {
   }
 }
 
+// Silence the buzzer pin completely
+void buzzerSilence() {
+  ledcDetach(BUZZER_PIN);
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
 void buzzerOff() {
-  if (buzzerEnabled) {
-    ledcDetach(BUZZER_PIN);
-    pinMode(BUZZER_PIN, OUTPUT);
-    digitalWrite(BUZZER_PIN, LOW);
+  if (buzzerEnabled || buzzerOn) {
+    buzzerSilence();
   }
   buzzerEnabled = false;
   buzzerOn = false;
 }
 
 void buzzerWarning() {
-  if (!buzzerEnabled) {
-    ledcAttach(BUZZER_PIN, 2000, 8);
-  }
   buzzerEnabled = true;
   buzzerInterval = 1000;  // Slow beep
   buzzerFreq = 1800;      // Lower pitch
@@ -1149,9 +1488,6 @@ void buzzerWarning() {
 }
 
 void buzzerAlarm() {
-  if (!buzzerEnabled) {
-    ledcAttach(BUZZER_PIN, 2000, 8);
-  }
   buzzerEnabled = true;
   buzzerInterval = 300;   // Fast beep
   buzzerFreq = 3000;      // Higher pitch
@@ -1161,7 +1497,7 @@ void buzzerAlarm() {
 void updateBuzzer() {
   // Handle alarm state changes
   if (!alarmActive || alarmMuted) {
-    if (buzzerEnabled) {
+    if (buzzerEnabled || buzzerOn) {
       buzzerOff();
     }
     return;
@@ -1182,12 +1518,12 @@ void updateBuzzer() {
     lastBuzzerToggle = now;
     buzzerOn = !buzzerOn;
     if (buzzerOn) {
-      ledcWriteTone(BUZZER_PIN, buzzerFreq);
+      // Attach PWM, play tone
+      ledcAttach(BUZZER_PIN, buzzerFreq, 8);
       ledcWrite(BUZZER_PIN, buzzerDuty);
     } else {
-      // Stop tone completely to prevent static noise
-      ledcWriteTone(BUZZER_PIN, 0);
-      ledcWrite(BUZZER_PIN, 0);
+      // Completely detach PWM and ground the pin
+      buzzerSilence();
     }
   }
 }
