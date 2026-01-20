@@ -132,6 +132,7 @@ struct Config {
   char wifiSSID[64];       // Truck's WiFi SSID (e.g., Starlink)
   char wifiPassword[64];   // WiFi password
   char dashboardURL[128];  // Dashboard API endpoint
+  char apiKey[64];         // API key for cloud authentication
   bool wifiEnabled;        // Enable WiFi client mode
 };
 
@@ -195,7 +196,7 @@ IPAddress apIP(192, 168, 4, 1);
 bool wifiClientConnected = false;
 unsigned long lastDashboardUpdate = 0;
 unsigned long lastWifiReconnectAttempt = 0;
-#define DASHBOARD_UPDATE_INTERVAL 5000   // Send data every 5 seconds
+#define DASHBOARD_UPDATE_INTERVAL 60000  // Send data every 60 seconds
 #define WIFI_RECONNECT_INTERVAL   30000  // Retry connection every 30 seconds
 
 // Display state
@@ -250,6 +251,8 @@ void handleApiData();
 // WiFi/Dashboard
 void connectToWiFi();
 void sendToDashboard();
+String getISOTimestamp();
+void getAlertInfo(TransmitterData* tx, String& level, String& message);
 
 // ======================== SETUP ========================
 void setup() {
@@ -347,14 +350,16 @@ void loadConfig() {
   config.critOffset = prefs.getFloat("critOffset", DEFAULT_CRIT_OFFSET);
   config.wifiEnabled = prefs.getBool("wifiEnabled", false);
 
-  // Load WiFi credentials
+  // Load WiFi credentials and API settings
   String ssid = prefs.getString("wifiSSID", "");
   String pass = prefs.getString("wifiPass", "");
-  String url = prefs.getString("dashURL", "");
+  String url = prefs.getString("dashURL", "https://axlewatch.com/api/telemetry");
+  String apiKey = prefs.getString("apiKey", "");
 
   strncpy(config.wifiSSID, ssid.c_str(), sizeof(config.wifiSSID) - 1);
   strncpy(config.wifiPassword, pass.c_str(), sizeof(config.wifiPassword) - 1);
   strncpy(config.dashboardURL, url.c_str(), sizeof(config.dashboardURL) - 1);
+  strncpy(config.apiKey, apiKey.c_str(), sizeof(config.apiKey) - 1);
 
   prefs.end();
 
@@ -378,6 +383,7 @@ void saveConfig() {
   prefs.putString("wifiSSID", config.wifiSSID);
   prefs.putString("wifiPass", config.wifiPassword);
   prefs.putString("dashURL", config.dashboardURL);
+  prefs.putString("apiKey", config.apiKey);
   prefs.end();
 
   Serial.println("Config saved");
@@ -1020,11 +1026,15 @@ void handleWifiConfig() {
       </div>
 
       <div class="card">
-        <h3 style="margin-top:0; color:#00d4ff;">Dashboard API</h3>
+        <h3 style="margin-top:0; color:#00d4ff;">Cloud Dashboard</h3>
 
         <label>Dashboard URL</label>
-        <input type="url" id="dashboardURL" value=")rawliteral" + String(config.dashboardURL) + R"rawliteral(" placeholder="https://your-dashboard.com/api/data">
+        <input type="url" id="dashboardURL" value=")rawliteral" + String(config.dashboardURL) + R"rawliteral(" placeholder="https://axlewatch.com/api/telemetry">
         <p class="hint">The API endpoint where temperature data will be sent</p>
+
+        <label>API Key</label>
+        <input type="text" id="apiKey" value=")rawliteral" + String(config.apiKey) + R"rawliteral(" placeholder="Enter your API key">
+        <p class="hint">Your AxleWatch API key for authentication</p>
       </div>
 
       <button type="submit" class="btn btn-primary">Save WiFi Settings</button>
@@ -1042,6 +1052,7 @@ void handleWifiConfig() {
       formData.append('wifiSSID', document.getElementById('wifiSSID').value);
       formData.append('wifiPassword', document.getElementById('wifiPassword').value);
       formData.append('dashboardURL', document.getElementById('dashboardURL').value);
+      formData.append('apiKey', document.getElementById('apiKey').value);
 
       fetch('/savewifi', {
         method: 'POST',
@@ -1076,6 +1087,9 @@ void handleSaveWifi() {
   }
   if (server.hasArg("dashboardURL")) {
     strncpy(config.dashboardURL, server.arg("dashboardURL").c_str(), sizeof(config.dashboardURL) - 1);
+  }
+  if (server.hasArg("apiKey")) {
+    strncpy(config.apiKey, server.arg("apiKey").c_str(), sizeof(config.apiKey) - 1);
   }
 
   saveConfig();
@@ -1154,13 +1168,59 @@ void handleApiData() {
 
 // ======================== DASHBOARD FUNCTIONS ========================
 
+// Get ISO timestamp string
+String getISOTimestamp() {
+  // Use GPS time if available, otherwise use millis-based approximation
+  char timestamp[32];
+  if (gpsData.validFix && gps.date.isValid() && gps.time.isValid()) {
+    snprintf(timestamp, sizeof(timestamp), "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             gps.date.year(), gps.date.month(), gps.date.day(),
+             gps.time.hour(), gps.time.minute(), gps.time.second());
+  } else {
+    // Fallback: Unix epoch + millis (not accurate but provides a timestamp)
+    unsigned long secs = millis() / 1000;
+    snprintf(timestamp, sizeof(timestamp), "1970-01-01T%02lu:%02lu:%02luZ",
+             (secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+  }
+  return String(timestamp);
+}
+
+// Find highest alarm level and message for a transmitter
+void getAlertInfo(TransmitterData* tx, String& level, String& message) {
+  float maxTemp = 0;
+  int maxAlarm = 0;
+  int maxHub = 0;
+
+  for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
+    if (tx->alarmLevels[j] > maxAlarm) {
+      maxAlarm = tx->alarmLevels[j];
+      maxTemp = tx->temps[j];
+      maxHub = j + 1;
+    } else if (tx->alarmLevels[j] == maxAlarm && tx->temps[j] > maxTemp) {
+      maxTemp = tx->temps[j];
+      maxHub = j + 1;
+    }
+  }
+
+  if (maxAlarm == 2) {
+    level = "critical";
+    message = "Critical temperature on hub " + String(maxHub) + ": " + String(maxTemp, 1) + "°C";
+  } else if (maxAlarm == 1) {
+    level = "warning";
+    message = "High temperature on hub " + String(maxHub) + ": " + String(maxTemp, 1) + "°C";
+  } else {
+    level = "";
+    message = "";
+  }
+}
+
 void sendToDashboard() {
   // Only send if connected and configured
   if (!wifiClientConnected || !config.wifiEnabled) {
     return;
   }
 
-  if (strlen(config.dashboardURL) == 0) {
+  if (strlen(config.dashboardURL) == 0 || strlen(config.apiKey) == 0) {
     return;
   }
 
@@ -1177,74 +1237,86 @@ void sendToDashboard() {
     return;
   }
 
-  // Build JSON payload
-  String json = "{";
-  json += "\"deviceId\":\"" + String(deviceID) + "\",";
-
-  // GPS data
-  json += "\"gps\":{";
-  json += "\"valid\":" + String(gpsData.validFix ? "true" : "false") + ",";
-  json += "\"lat\":" + String(gpsData.latitude, 6) + ",";
-  json += "\"lon\":" + String(gpsData.longitude, 6) + ",";
-  json += "\"speed\":" + String(gpsData.speedKmh, 1) + ",";
-  json += "\"sats\":" + String(gpsData.satellites);
-  json += "},";
-
-  // Alarm status
-  json += "\"alarmLevel\":" + String(currentAlarmLevel) + ",";
-
-  // Transmitters
-  json += "\"transmitters\":[";
-  bool first = true;
+  // Send data for each active transmitter
   for (int i = 0; i < MAX_TRANSMITTERS; i++) {
-    if (transmitters[i].active) {
-      if (!first) json += ",";
-      first = false;
+    if (!transmitters[i].active) continue;
 
-      json += "{";
-      json += "\"id\":\"" + String(transmitters[i].txID) + "\",";
-      json += "\"rssi\":" + String(transmitters[i].rssi) + ",";
-      json += "\"ambient\":" + String(transmitters[i].ambientTemp, 1) + ",";
+    TransmitterData* tx = &transmitters[i];
 
-      json += "\"temps\":[";
-      for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
-        if (j > 0) json += ",";
-        json += String(transmitters[i].temps[j], 1);
-      }
-      json += "],";
+    // Build JSON payload per AxleWatch API spec
+    String json = "{";
 
-      json += "\"alarms\":[";
-      for (int j = 0; j < NUM_TEMP_SENSORS; j++) {
-        if (j > 0) json += ",";
-        json += String(transmitters[i].alarmLevels[j]);
-      }
-      json += "]";
+    // Device ID (receiver MAC)
+    json += "\"device_id\":\"" + String(deviceID) + "\",";
+
+    // Timestamp in ISO format
+    json += "\"timestamp\":\"" + getISOTimestamp() + "\",";
+
+    // Trailer ID (transmitter ID)
+    json += "\"trailer_id\":\"" + String(tx->txID) + "\",";
+
+    // Readings object with hub_1 through hub_8 and ambient_temp
+    json += "\"readings\":{";
+    for (int j = 0; j < 8; j++) {
+      json += "\"hub_" + String(j + 1) + "\":" + String(tx->temps[j], 1);
+      json += ",";
+    }
+    json += "\"ambient_temp\":" + String(tx->ambientTemp, 1);
+    json += "},";
+
+    // Location object
+    json += "\"location\":{";
+    json += "\"latitude\":" + String(gpsData.latitude, 6) + ",";
+    json += "\"longitude\":" + String(gpsData.longitude, 6) + ",";
+    json += "\"speed\":" + String(gpsData.speedKmh, 1);
+    json += "}";
+
+    // Alert object (optional, only if there's a warning or critical)
+    String alertLevel, alertMessage;
+    getAlertInfo(tx, alertLevel, alertMessage);
+    if (alertLevel.length() > 0) {
+      json += ",\"alert\":{";
+      json += "\"level\":\"" + alertLevel + "\",";
+      json += "\"message\":\"" + alertMessage + "\"";
       json += "}";
     }
-  }
-  json += "]";
-  json += "}";
 
-  // Send HTTP POST
-  HTTPClient http;
-  http.begin(config.dashboardURL);
-  http.addHeader("Content-Type", "application/json");
+    json += "}";
 
-  int httpCode = http.POST(json);
+    // Send HTTP POST
+    HTTPClient http;
+    http.begin(config.dashboardURL);
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", "Bearer " + String(config.apiKey));
 
-  if (httpCode > 0) {
-    if (httpCode == HTTP_CODE_OK) {
-      Serial.println("Dashboard update sent successfully");
+    Serial.print("[CloudUpload] Posting to: ");
+    Serial.println(config.dashboardURL);
+    Serial.print("[CloudUpload] Payload size: ");
+    Serial.print(json.length());
+    Serial.println(" bytes");
+
+    int httpCode = http.POST(json);
+
+    if (httpCode > 0) {
+      if (httpCode == HTTP_CODE_OK) {
+        Serial.print("[CloudUpload] Success for trailer ");
+        Serial.println(tx->txID);
+      } else {
+        Serial.print("[CloudUpload] HTTP error ");
+        Serial.print(httpCode);
+        Serial.print(" for trailer ");
+        Serial.println(tx->txID);
+      }
     } else {
-      Serial.print("Dashboard HTTP error: ");
-      Serial.println(httpCode);
+      Serial.print("[CloudUpload] Connection failed: ");
+      Serial.println(http.errorToString(httpCode));
     }
-  } else {
-    Serial.print("Dashboard connection failed: ");
-    Serial.println(http.errorToString(httpCode));
-  }
 
-  http.end();
+    http.end();
+
+    // Small delay between uploads if multiple trailers
+    delay(100);
+  }
 }
 
 // ======================== UPDATE FUNCTIONS ========================
