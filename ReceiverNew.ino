@@ -28,6 +28,7 @@
 #include <SD.h>
 #include <FS.h>
 #include <HTTPClient.h>
+#include <ArduinoJson.h>
 
 // ======================== PIN DEFINITIONS ========================
 // ESP32-WROOM-32 Pin Assignments - AxleWatch Homebrew Receiver
@@ -1213,27 +1214,66 @@ void getAlertInfo(TransmitterData* tx, String& level, String& message) {
 }
 
 void sendToDashboard() {
-  // Only send if connected and configured
-  if (!wifiClientConnected || !config.wifiEnabled) {
+  Serial.println("[CloudUpload] Checking upload conditions...");
+
+  // Debug: print current state
+  Serial.print("[CloudUpload] wifiClientConnected=");
+  Serial.print(wifiClientConnected);
+  Serial.print(", wifiEnabled=");
+  Serial.print(config.wifiEnabled);
+  Serial.print(", WiFi.status()=");
+  Serial.println(WiFi.status());
+
+  // Only send if WiFi is enabled and configured
+  if (!config.wifiEnabled) {
+    Serial.println("[CloudUpload] WiFi not enabled, skipping");
     return;
   }
 
-  if (strlen(config.dashboardURL) == 0 || strlen(config.apiKey) == 0) {
+  if (strlen(config.dashboardURL) == 0) {
+    Serial.println("[CloudUpload] No dashboard URL configured, skipping");
+    return;
+  }
+
+  if (strlen(config.apiKey) == 0) {
+    Serial.println("[CloudUpload] No API key configured, skipping");
     return;
   }
 
   // Rate limit
   unsigned long now = millis();
   if (now - lastDashboardUpdate < DASHBOARD_UPDATE_INTERVAL) {
-    return;
+    return;  // Silent return for rate limiting
   }
   lastDashboardUpdate = now;
 
   // Check WiFi status
   if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[CloudUpload] WiFi not connected, skipping");
     wifiClientConnected = false;
     return;
   }
+
+  wifiClientConnected = true;
+
+  // Count active transmitters
+  int activeTxCount = 0;
+  for (int i = 0; i < MAX_TRANSMITTERS; i++) {
+    if (transmitters[i].active) activeTxCount++;
+  }
+
+  if (activeTxCount == 0) {
+    Serial.println("[CloudUpload] No active transmitters, skipping");
+    return;
+  }
+
+  Serial.print("[CloudUpload] Starting upload for ");
+  Serial.print(activeTxCount);
+  Serial.println(" trailer(s)...");
+
+  // Build Authorization header
+  String authHeader = "Bearer ";
+  authHeader += config.apiKey;
 
   // Send data for each active transmitter
   for (int i = 0; i < MAX_TRANSMITTERS; i++) {
@@ -1241,80 +1281,143 @@ void sendToDashboard() {
 
     TransmitterData* tx = &transmitters[i];
 
-    // Build JSON payload per AxleWatch API spec
-    String json = "{";
+    Serial.print("[CloudUpload] Uploading trailer ");
+    Serial.println(tx->txID);
+
+    // Build JSON payload using ArduinoJson (matches sample firmware)
+    StaticJsonDocument<1024> doc;
 
     // Device ID (receiver MAC)
-    json += "\"device_id\":\"" + String(deviceID) + "\",";
+    doc["device_id"] = deviceID;
 
     // Timestamp in ISO format
-    json += "\"timestamp\":\"" + getISOTimestamp() + "\",";
+    doc["timestamp"] = getISOTimestamp();
 
     // Trailer ID (transmitter ID)
-    json += "\"trailer_id\":\"" + String(tx->txID) + "\",";
+    doc["trailer_id"] = tx->txID;
 
     // Readings object with hub_1 through hub_8 and ambient_temp
-    json += "\"readings\":{";
-    for (int j = 0; j < 8; j++) {
-      json += "\"hub_" + String(j + 1) + "\":" + String(tx->temps[j], 1);
-      json += ",";
-    }
-    json += "\"ambient_temp\":" + String(tx->ambientTemp, 1);
-    json += "},";
+    JsonObject readings = doc.createNestedObject("readings");
+    readings["hub_1"] = tx->temps[0];
+    readings["hub_2"] = tx->temps[1];
+    readings["hub_3"] = tx->temps[2];
+    readings["hub_4"] = tx->temps[3];
+    readings["hub_5"] = tx->temps[4];
+    readings["hub_6"] = tx->temps[5];
+    readings["hub_7"] = tx->temps[6];
+    readings["hub_8"] = tx->temps[7];
+    readings["ambient_temp"] = tx->ambientTemp;
 
     // Location object
-    json += "\"location\":{";
-    json += "\"latitude\":" + String(gpsData.latitude, 6) + ",";
-    json += "\"longitude\":" + String(gpsData.longitude, 6) + ",";
-    json += "\"speed\":" + String(gpsData.speedKmh, 1);
-    json += "}";
+    JsonObject location = doc.createNestedObject("location");
+    location["latitude"] = gpsData.latitude;
+    location["longitude"] = gpsData.longitude;
+    location["speed"] = gpsData.speedKmh;
 
-    // Alert object (optional, only if there's a warning or critical)
-    String alertLevel, alertMessage;
-    getAlertInfo(tx, alertLevel, alertMessage);
-    if (alertLevel.length() > 0) {
-      json += ",\"alert\":{";
-      json += "\"level\":\"" + alertLevel + "\",";
-      json += "\"message\":\"" + alertMessage + "\"";
-      json += "}";
+    // Alert object (optional) - check delta from ambient
+    float maxDelta = 0;
+    float maxTemp = 0;
+    for (int j = 0; j < 8; j++) {
+      float temp = tx->temps[j];
+      if (temp > 1.0) {
+        float delta = temp - tx->ambientTemp;
+        if (delta > maxDelta) {
+          maxDelta = delta;
+          maxTemp = temp;
+        }
+      }
     }
 
-    json += "}";
+    if (maxDelta > config.warnOffset) {
+      JsonObject alert = doc.createNestedObject("alert");
+      if (maxDelta > config.critOffset) {
+        alert["level"] = "critical";
+      } else {
+        alert["level"] = "warning";
+      }
+      char msg[100];
+      snprintf(msg, sizeof(msg), "High temperature detected: %.1fC (%.1fC above ambient)", maxTemp, maxDelta);
+      alert["message"] = msg;
+    }
 
-    // Send HTTP POST
-    HTTPClient http;
-    http.begin(config.dashboardURL);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("Authorization", "Bearer " + String(config.apiKey));
+    // Serialize JSON
+    String payload;
+    serializeJson(doc, payload);
 
+    Serial.print("[CloudUpload] Payload size: ");
+    Serial.print(payload.length());
+    Serial.println(" bytes");
     Serial.print("[CloudUpload] Posting to: ");
     Serial.println(config.dashboardURL);
-    Serial.print("[CloudUpload] Payload size: ");
-    Serial.print(json.length());
-    Serial.println(" bytes");
 
-    int httpCode = http.POST(json);
+    // Send HTTP POST with timeout and redirect handling
+    HTTPClient http;
+    http.setTimeout(10000);  // 10 second timeout
 
-    if (httpCode > 0) {
-      if (httpCode == HTTP_CODE_OK) {
-        Serial.print("[CloudUpload] Success for trailer ");
-        Serial.println(tx->txID);
+    String currentUrl = config.dashboardURL;
+    int httpCode = -1;
+    int redirectCount = 0;
+    const int MAX_REDIRECTS = 3;
+
+    // Manual redirect loop (HTTPClient doesn't follow POST redirects properly)
+    while (redirectCount <= MAX_REDIRECTS) {
+      http.begin(currentUrl);
+      http.addHeader("Content-Type", "application/json");
+      http.addHeader("Authorization", authHeader);
+
+      httpCode = http.POST(payload);
+
+      if (httpCode > 0) {
+        Serial.print("[CloudUpload] HTTP Response code: ");
+        Serial.println(httpCode);
+
+        // Check if redirect (3xx)
+        if (httpCode >= 300 && httpCode < 400) {
+          String location = http.getLocation();
+          if (location.length() > 0) {
+            Serial.print("[CloudUpload] Redirected to: ");
+            Serial.println(location);
+            http.end();
+            currentUrl = location;
+            redirectCount++;
+            continue;
+          } else {
+            Serial.println("[CloudUpload] Redirect but no Location header");
+            break;
+          }
+        }
+        break;  // Not a redirect
       } else {
-        Serial.print("[CloudUpload] HTTP error ");
-        Serial.print(httpCode);
-        Serial.print(" for trailer ");
-        Serial.println(tx->txID);
+        Serial.print("[CloudUpload] Connection error: ");
+        Serial.println(http.errorToString(httpCode));
+        break;
       }
-    } else {
-      Serial.print("[CloudUpload] Connection failed: ");
-      Serial.println(http.errorToString(httpCode));
+    }
+
+    // Process final response
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+      Serial.print("[CloudUpload] SUCCESS for trailer ");
+      Serial.println(tx->txID);
+    } else if (httpCode > 0) {
+      String response = http.getString();
+      Serial.print("[CloudUpload] FAILED for trailer ");
+      Serial.print(tx->txID);
+      Serial.print(" (HTTP ");
+      Serial.print(httpCode);
+      Serial.println(")");
+      if (response.length() > 0 && response.length() < 500) {
+        Serial.print("[CloudUpload] Response: ");
+        Serial.println(response);
+      }
     }
 
     http.end();
 
-    // Small delay between uploads if multiple trailers
+    // Small delay between uploads
     delay(100);
   }
+
+  Serial.println("[CloudUpload] Upload cycle complete");
 }
 
 // ======================== UPDATE FUNCTIONS ========================
